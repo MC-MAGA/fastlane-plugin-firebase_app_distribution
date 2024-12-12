@@ -1,8 +1,9 @@
 require 'fastlane/action'
+require 'fastlane_core'
 require 'open3'
 require 'shellwords'
 require 'googleauth'
-require 'google/apis/firebaseappdistribution_v1'
+require_relative '../helper/firebase_app_distribution_apis'
 require_relative '../helper/firebase_app_distribution_helper'
 require_relative '../helper/firebase_app_distribution_error_message'
 require_relative '../helper/firebase_app_distribution_auth_client'
@@ -158,11 +159,14 @@ module Fastlane
         # the same lane
         return nil if lane_platform == :android
 
+        # rubocop:disable Require/MissingRequireStatement
         Actions.lane_context[SharedValues::XCODEBUILD_ARCHIVE]
+        # rubocop:enable Require/MissingRequireStatement
       end
 
       def self.lane_platform
-        Actions.lane_context[Actions::SharedValues::PLATFORM_NAME]
+        # to_sym shouldn't be necessary, but possibly fixes #376
+        Actions.lane_context[Actions::SharedValues::PLATFORM_NAME]&.to_sym
       end
 
       def self.platform_from_app_id(app_id)
@@ -173,6 +177,7 @@ module Fastlane
         end
       end
 
+      # rubocop:disable Require/MissingRequireStatement
       def self.get_binary_path(platform, params)
         if platform == :ios
           return params[:ipa_path] ||
@@ -193,7 +198,11 @@ module Fastlane
                  Dir["*.apk"].last ||
                  Dir[File.join("app", "build", "outputs", "apk", "release", "app-release.apk")].last
         end
+
+        UI.error("Unable to determine binary path for unsupported platform #{platform}.")
+        nil
       end
+      # rubocop:enable Require/MissingRequireStatement
 
       def self.get_upload_timeout(params)
         if params[:upload_timeout]
@@ -232,7 +241,9 @@ module Fastlane
       def self.release_notes(params)
         release_notes_param =
           get_value_from_value_or_file(params[:release_notes], params[:release_notes_file])
+        # rubocop:disable Require/MissingRequireStatement
         release_notes_param || Actions.lane_context[SharedValues::FL_CHANGELOG]
+        # rubocop:enable Require/MissingRequireStatement
       end
 
       def self.poll_upload_release_operation(client, operation, binary_type)
@@ -502,7 +513,7 @@ module Fastlane
                                        type: String),
           FastlaneCore::ConfigItem.new(key: :groups_file,
                                        env_name: "FIREBASEAPPDISTRO_GROUPS_FILE",
-                                       description: "Path to file containing group aliases used for distribution, separated by commas",
+                                       description: "Path to file containing group aliases used for distribution, separated by commas or newlines",
                                        optional: true,
                                        type: String),
           FastlaneCore::ConfigItem.new(key: :testers,
@@ -512,7 +523,7 @@ module Fastlane
                                        type: String),
           FastlaneCore::ConfigItem.new(key: :testers_file,
                                        env_name: "FIREBASEAPPDISTRO_TESTERS_FILE",
-                                       description: "Path to file containing email addresses of testers, separated by commas",
+                                       description: "Path to file containing email addresses of testers, separated by commas or newlines",
                                        optional: true,
                                        type: String),
           FastlaneCore::ConfigItem.new(key: :release_notes,
@@ -529,12 +540,13 @@ module Fastlane
           # Release Testing
           FastlaneCore::ConfigItem.new(key: :test_devices,
                                        env_name: "FIREBASEAPPDISTRO_TEST_DEVICES",
-                                       description: "List of devices to run automated tests on, in the format 'model=<model-id>,version=<os-version-id>,locale=<locale>,orientation=<orientation>;model=<model-id>,...'. Run 'gcloud firebase test android|ios models list' to see available devices. Note: This feature is in beta",
+                                       description: "List of devices (separated by semicolons) to run automated tests on, in the format 'model=<model-id>,version=<os-version-id>,locale=<locale>,orientation=<orientation>;model=<model-id>,...'. Run 'gcloud firebase test android|ios models list' to see available devices. Note: This feature is in beta",
                                        optional: true,
                                        type: String),
           FastlaneCore::ConfigItem.new(key: :test_devices_file,
                                        env_name: "FIREBASEAPPDISTRO_TEST_DEVICES_FILE",
-                                       description: "Path to file containing a list of devices to run automated tests on, in the format 'model=<model-id>,version=<os-version-id>,locale=<locale>,orientation=<orientation>;model=<model-id>,...'. Run 'gcloud firebase test android|ios models list' to see available devices. Note: This feature is in beta",
+                                       description: "Path to file containing a list of devices (sepatated by semicolons or newlines) to run automated tests on, in the format 'model=<model-id>,version=<os-version-id>,locale=<locale>,orientation=<orientation>;model=<model-id>,...'. " \
+                                       "Run 'gcloud firebase test android|ios models list' to see available devices. Note: This feature is in beta",
                                        optional: true,
                                        type: String),
           FastlaneCore::ConfigItem.new(key: :test_username,
@@ -586,11 +598,7 @@ module Fastlane
       end
 
       def self.is_supported?(platform)
-        # Adjust this if your plugin only works for a particular platform (iOS vs. Android, for example)
-        # See: https://docs.fastlane.tools/advanced/#control-configuration-by-lane-and-by-platform
-        #
-        # [:ios, :mac, :android].include?(platform)
-        true
+        [:ios, :android].include?(platform)
       end
 
       def self.example_code
