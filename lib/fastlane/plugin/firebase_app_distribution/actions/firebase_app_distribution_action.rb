@@ -1,8 +1,9 @@
 require 'fastlane/action'
+require 'fastlane_core'
 require 'open3'
 require 'shellwords'
 require 'googleauth'
-require 'google/apis/firebaseappdistribution_v1'
+require_relative '../helper/firebase_app_distribution_apis'
 require_relative '../helper/firebase_app_distribution_helper'
 require_relative '../helper/firebase_app_distribution_error_message'
 require_relative '../helper/firebase_app_distribution_auth_client'
@@ -56,7 +57,7 @@ module Fastlane
 
         binary_type = binary_type_from_path(binary_path)
         UI.message("📡 Uploading the #{binary_type}.")
-        operation = upload_binary(app_name, binary_path, binary_type, client, timeout)
+        operation = upload_binary(client, app_name, binary_path, binary_type, timeout)
         UI.message("🕵️ Validating upload…")
         release = poll_upload_release_operation(client, operation, binary_type)
 
@@ -87,11 +88,12 @@ module Fastlane
         test_devices =
           get_value_from_value_or_file(params[:test_devices], params[:test_devices_file])
         if present?(test_devices)
-          UI.message("🤖 Starting automated tests. Note: This feature is in beta.")
+          test_cases =
+            string_to_array(get_value_from_value_or_file(params[:test_case_ids], params[:test_case_ids_file]))&.map { |id| "#{app_name}/testCases/#{id}" }
           test_password = test_password_from_params(params)
-          release_test = test_release(alpha_client, release, test_devices, params[:test_username], test_password, params[:test_username_resource], params[:test_password_resource])
+          release_tests = test_release(alpha_client, release, test_devices, test_cases, params[:test_username], test_password, params[:test_username_resource], params[:test_password_resource])
           unless params[:test_non_blocking]
-            poll_test_finished(alpha_client, release_test.name)
+            poll_test_finished(alpha_client, release_tests)
           end
         end
 
@@ -158,11 +160,14 @@ module Fastlane
         # the same lane
         return nil if lane_platform == :android
 
+        # rubocop:disable Require/MissingRequireStatement
         Actions.lane_context[SharedValues::XCODEBUILD_ARCHIVE]
+        # rubocop:enable Require/MissingRequireStatement
       end
 
       def self.lane_platform
-        Actions.lane_context[Actions::SharedValues::PLATFORM_NAME]
+        # to_sym shouldn't be necessary, but possibly fixes #376
+        Actions.lane_context[Actions::SharedValues::PLATFORM_NAME]&.to_sym
       end
 
       def self.platform_from_app_id(app_id)
@@ -173,6 +178,7 @@ module Fastlane
         end
       end
 
+      # rubocop:disable Require/MissingRequireStatement
       def self.get_binary_path(platform, params)
         if platform == :ios
           return params[:ipa_path] ||
@@ -193,7 +199,11 @@ module Fastlane
                  Dir["*.apk"].last ||
                  Dir[File.join("app", "build", "outputs", "apk", "release", "app-release.apk")].last
         end
+
+        UI.error("Unable to determine binary path for unsupported platform #{platform}.")
+        nil
       end
+      # rubocop:enable Require/MissingRequireStatement
 
       def self.get_upload_timeout(params)
         if params[:upload_timeout]
@@ -232,7 +242,9 @@ module Fastlane
       def self.release_notes(params)
         release_notes_param =
           get_value_from_value_or_file(params[:release_notes], params[:release_notes_file])
+        # rubocop:disable Require/MissingRequireStatement
         release_notes_param || Actions.lane_context[SharedValues::FL_CHANGELOG]
+        # rubocop:enable Require/MissingRequireStatement
       end
 
       def self.poll_upload_release_operation(client, operation, binary_type)
@@ -268,7 +280,7 @@ module Fastlane
         extract_release(operation)
       end
 
-      def self.upload_binary(app_name, binary_path, binary_type, client, timeout)
+      def self.upload_binary(client, app_name, binary_path, binary_type, timeout)
         options = Google::Apis::RequestOptions.new
         options.max_elapsed_time = timeout # includes retries (default = no retries)
         options.header = {
@@ -348,7 +360,10 @@ module Fastlane
         end
       end
 
-      def self.test_release(alpha_client, release, test_devices, username = nil, password = nil, username_resource = nil, password_resource = nil)
+      def self.test_release(alpha_client, release, test_devices, test_cases, username = nil, password = nil, username_resource = nil, password_resource = nil)
+        if present?(test_cases) && (!username_resource.nil? || !password_resource.nil?)
+          UI.user_error!("Password and username resource names are not supported for the testing agent.")
+        end
         if username_resource.nil? ^ password_resource.nil?
           UI.user_error!("Username and password resource names for automated tests need to be specified together.")
         end
@@ -378,7 +393,7 @@ module Fastlane
           end
         end
 
-        device_executions = string_to_array(test_devices, ';').map do |td_string|
+        device_executions = string_to_array(test_devices, /[;\n]/).map do |td_string|
           td_hash = parse_test_device_string(td_string)
           Google::Apis::FirebaseappdistributionV1alpha::GoogleFirebaseAppdistroV1alphaDeviceExecution.new(
             device: Google::Apis::FirebaseappdistributionV1alpha::GoogleFirebaseAppdistroV1alphaTestDevice.new(
@@ -390,36 +405,63 @@ module Fastlane
           )
         end
 
-        release_test =
-          Google::Apis::FirebaseappdistributionV1alpha::GoogleFirebaseAppdistroV1alphaReleaseTest.new(
-            login_credential: login_credential,
-            device_executions: device_executions
-          )
-        alpha_client.create_project_app_release_test(release.name, release_test)
-      rescue Google::Apis::Error => err
-        UI.crash!(err)
+        UI.message("🤖 Starting automated tests. Note: This feature is in beta.")
+        release_tests = []
+        if present?(test_cases)
+          test_cases.each do |tc|
+            release_tests.push(create_release_test(alpha_client, release.name, device_executions, login_credential, tc))
+          end
+        else
+          release_tests.push(create_release_test(alpha_client, release.name, device_executions, login_credential))
+        end
+        release_tests
       end
 
-      def self.poll_test_finished(alpha_client, release_test_name)
+      def self.create_release_test(alpha_client, release_name, device_executions, login_credential, test_case_name = nil)
+        release_test =
+          Google::Apis::FirebaseappdistributionV1alpha::GoogleFirebaseAppdistroV1alphaReleaseTest.new(
+            device_executions: device_executions,
+            login_credential: login_credential,
+            test_case: test_case_name
+          )
+        alpha_client.create_project_app_release_test(release_name, release_test)
+      rescue Google::Apis::Error => err
+        case err.status_code.to_i
+        when 404
+          UI.user_error!("Test Case #{test_case_name} not found")
+        else
+          UI.crash!(err)
+        end
+      end
+
+      def self.poll_test_finished(alpha_client, release_tests)
+        release_test_names = release_tests.map(&:name)
         TEST_MAX_POLLING_RETRIES.times do
-          UI.message("⏳ The automated test results are pending.")
+          UI.message("⏳ #{release_test_names.size} automated test results are pending.")
           sleep(TEST_POLLING_INTERVAL_SECONDS)
-          release_test = alpha_client.get_project_app_release_test(release_test_name)
-          if release_test.device_executions.all? { |e| e.state == 'PASSED' }
+          release_test_names.delete_if do |release_test_name|
+            release_test = alpha_client.get_project_app_release_test(release_test_name)
+            if release_test.device_executions.all? { |e| e.state == 'PASSED' }
+              true
+            else
+              release_test.device_executions.each do |de|
+                case de.state
+                when 'PASSED', 'IN_PROGRESS'
+                  next
+                when 'FAILED'
+                  UI.test_failure!("Automated test failed for #{device_to_s(de.device)}: #{de.failed_reason}.")
+                when 'INCONCLUSIVE'
+                  UI.test_failure!("Automated test inconclusive for #{device_to_s(de.device)}: #{de.inconclusive_reason}.")
+                else
+                  UI.test_failure!("Unsupported automated test state for #{device_to_s(de.device)}: #{de.state}.")
+                end
+              end
+              false
+            end
+          end
+          if release_test_names.empty?
             UI.success("✅ Passed automated test(s).")
             return
-          end
-          release_test.device_executions.each do |de|
-            case de.state
-            when 'PASSED', 'IN_PROGRESS'
-              next
-            when 'FAILED'
-              UI.test_failure!("Automated test failed for #{device_to_s(de.device)}: #{de.failed_reason}.")
-            when 'INCONCLUSIVE'
-              UI.test_failure!("Automated test inconclusive for #{device_to_s(de.device)}: #{de.inconclusive_reason}.")
-            else
-              UI.test_failure!("Unsupported automated test state for #{device_to_s(de.device)}: #{de.state}.")
-            end
           end
         end
         UI.test_failure!("It took longer than expected to process your test, please try again.")
@@ -502,7 +544,7 @@ module Fastlane
                                        type: String),
           FastlaneCore::ConfigItem.new(key: :groups_file,
                                        env_name: "FIREBASEAPPDISTRO_GROUPS_FILE",
-                                       description: "Path to file containing group aliases used for distribution, separated by commas",
+                                       description: "Path to file containing group aliases used for distribution, separated by commas or newlines",
                                        optional: true,
                                        type: String),
           FastlaneCore::ConfigItem.new(key: :testers,
@@ -512,7 +554,7 @@ module Fastlane
                                        type: String),
           FastlaneCore::ConfigItem.new(key: :testers_file,
                                        env_name: "FIREBASEAPPDISTRO_TESTERS_FILE",
-                                       description: "Path to file containing email addresses of testers, separated by commas",
+                                       description: "Path to file containing email addresses of testers, separated by commas or newlines",
                                        optional: true,
                                        type: String),
           FastlaneCore::ConfigItem.new(key: :release_notes,
@@ -529,12 +571,13 @@ module Fastlane
           # Release Testing
           FastlaneCore::ConfigItem.new(key: :test_devices,
                                        env_name: "FIREBASEAPPDISTRO_TEST_DEVICES",
-                                       description: "List of devices to run automated tests on, in the format 'model=<model-id>,version=<os-version-id>,locale=<locale>,orientation=<orientation>;model=<model-id>,...'. Run 'gcloud firebase test android|ios models list' to see available devices. Note: This feature is in beta",
+                                       description: "List of devices (separated by semicolons) to run automated tests on, in the format 'model=<model-id>,version=<os-version-id>,locale=<locale>,orientation=<orientation>;model=<model-id>,...'. Run 'gcloud firebase test android|ios models list' to see available devices. Note: This feature is in beta",
                                        optional: true,
                                        type: String),
           FastlaneCore::ConfigItem.new(key: :test_devices_file,
                                        env_name: "FIREBASEAPPDISTRO_TEST_DEVICES_FILE",
-                                       description: "Path to file containing a list of devices to run automated tests on, in the format 'model=<model-id>,version=<os-version-id>,locale=<locale>,orientation=<orientation>;model=<model-id>,...'. Run 'gcloud firebase test android|ios models list' to see available devices. Note: This feature is in beta",
+                                       description: "Path to file containing a list of devices (sepatated by semicolons or newlines) to run automated tests on, in the format 'model=<model-id>,version=<os-version-id>,locale=<locale>,orientation=<orientation>;model=<model-id>,...'. " \
+                                       "Run 'gcloud firebase test android|ios models list' to see available devices. Note: This feature is in beta",
                                        optional: true,
                                        type: String),
           FastlaneCore::ConfigItem.new(key: :test_username,
@@ -568,6 +611,16 @@ module Fastlane
                                        optional: false,
                                        default_value: false,
                                        type: Boolean),
+          FastlaneCore::ConfigItem.new(key: :test_case_ids,
+                                       env_name: "FIREBASEAPPDISTRO_TEST_CASE_IDS",
+                                       description: "Test Case IDs, separated by commas. Note: This feature is in beta",
+                                       optional: true,
+                                       type: String),
+          FastlaneCore::ConfigItem.new(key: :test_case_ids_file,
+                                       env_name: "FIREBASEAPPDISTRO_TEST_CASE_IDS_FILE",
+                                       description: "Path to file with containing Test Case IDs, separated by commas or newlines. Note: This feature is in beta",
+                                       optional: true,
+                                       type: String),
 
           # Auth
           FastlaneCore::ConfigItem.new(key: :firebase_cli_token,
@@ -586,11 +639,7 @@ module Fastlane
       end
 
       def self.is_supported?(platform)
-        # Adjust this if your plugin only works for a particular platform (iOS vs. Android, for example)
-        # See: https://docs.fastlane.tools/advanced/#control-configuration-by-lane-and-by-platform
-        #
-        # [:ios, :mac, :android].include?(platform)
-        true
+        [:ios, :android].include?(platform)
       end
 
       def self.example_code

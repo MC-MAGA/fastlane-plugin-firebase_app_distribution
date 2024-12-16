@@ -1,5 +1,8 @@
 require 'fastlane_core/ui/ui'
 require 'cfpropertylist'
+require 'google/apis/core'
+require 'google/apis/options'
+require_relative './firebase_app_distribution_error_message'
 
 module Fastlane
   UI = FastlaneCore::UI unless Fastlane.const_defined?("UI")
@@ -27,7 +30,7 @@ module Fastlane
 
       # Returns the array representation of a string with trimmed comma
       # seperated values.
-      def string_to_array(string, delimiter = ",")
+      def string_to_array(string, delimiter = /[,\n]/)
         return [] if string.nil?
         # Strip string and then strip individual values
         string.strip.split(delimiter).map(&:strip)
